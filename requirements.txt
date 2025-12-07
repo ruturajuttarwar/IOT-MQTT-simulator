@@ -1,0 +1,26 @@
+# Core MQTT
+paho-mqtt>=1.6.1
+
+# Async framework
+asyncio
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+jinja2>=3.1.2
+websockets>=12.0
+
+# Data processing
+numpy>=1.24.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# Network graph
+networkx>=3.1
+
+# System monitoring
+psutil>=5.9.0
+
+# Web server
+python-multipart>=0.0.6
