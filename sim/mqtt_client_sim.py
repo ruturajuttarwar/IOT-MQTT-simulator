@@ -24,6 +24,7 @@ class MQTTClientSim:
         self.keep_alive = MQTT_KEEP_ALIVE
         self.clean_session = MQTT_CLEAN_SESSION
         self.last_ping = 0
+        self.default_qos = 1  # Default QoS for this client
         
         # Last Will Testament (LWT)
         self.lwt_topic = f"nodes/{client_id}/status"
@@ -185,11 +186,15 @@ class MQTTClientSim:
             self.retained_messages[topic] = message
             log_mqtt_event(self.client_id, f"Retained message on {topic}")
         
-        # Track QoS 1 messages
+        # Track QoS 1 messages for retransmission
         if qos == 1:
             self.inflight_messages[msg_id] = message
             self.stats['qos1_messages'] += 1
+            
+            # Start retransmission timer (will retry if no ACK)
+            asyncio.create_task(self._handle_qos1_retransmit(msg_id, topic, payload, qos, retain))
         else:
+            # QoS 0: fire and forget, no ACK needed
             self.stats['qos0_messages'] += 1
             
         self.stats['messages_sent'] += 1
@@ -200,10 +205,13 @@ class MQTTClientSim:
         
         # Simulate WAN packet loss
         if random.random() < self.wan_packet_loss:
-            log_mqtt_event(self.client_id, f"Message lost in WAN (topic: {topic})")
+            log_mqtt_event(self.client_id, f"Message lost in WAN (topic: {topic}, QoS: {qos})")
             if qos == 1:
-                # Will be retried
+                # Will be retried automatically
                 message['dup'] = True
+            else:
+                # QoS 0: message is lost forever
+                log_mqtt_event(self.client_id, f"QoS 0 message lost - no retry")
             return False
         
         return True
@@ -246,9 +254,25 @@ class MQTTClientSim:
         await asyncio.sleep(0.001)
         # In real implementation, would send actual PUBACK packet
         
-    async def handle_puback(self, msg_id: int):
-        """Handle PUBACK reception"""
+    async def _handle_qos1_retransmit(self, msg_id: int, topic: str, payload: bytes, qos: int, retain: bool):
+        """Handle QoS 1 retransmission if ACK not received"""
+        retry_delay = 3.0  # Wait 3 seconds for ACK
+        await asyncio.sleep(retry_delay)
+        
+        # Check if message still in flight (ACK not received)
         if msg_id in self.inflight_messages:
+            msg = self.inflight_messages[msg_id]
+            msg['dup'] = True  # Set DUP flag
+            
+            log_mqtt_event(self.client_id, f"QoS 1 retransmit (DUP=1) for msg_id {msg_id}")
+            
+            # Retransmit
+            await self.publish(topic, payload, qos, retain)
+    
+    async def handle_puback(self, msg_id: int):
+        """Handle PUBACK reception - removes message from inflight queue"""
+        if msg_id in self.inflight_messages:
+            log_mqtt_event(self.client_id, f"PUBACK received for msg_id {msg_id}")
             del self.inflight_messages[msg_id]
             
     async def send_ping(self):

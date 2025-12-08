@@ -37,25 +37,63 @@ def hook_mqtt_client(node):
     original_subscribe = client.subscribe
     
     async def hooked_publish(topic, payload, qos=0, retain=False):
-        mqtt_operations.append({
-            'type': 'PUBLISH',
-            'node': node.node_id,
-            'topic': topic,
-            'payload': payload.decode() if isinstance(payload, bytes) else str(payload),
-            'qos': qos,
-            'retain': retain,
-            'timestamp': time.time()
-        })
-        return await original_publish(topic, payload, qos, retain)
+        payload_str = payload.decode() if isinstance(payload, bytes) else str(payload)
+        
+        # Filter out status messages - only log sensor data
+        if 'status' not in topic:
+            mqtt_operations.append({
+                'type': 'PUBLISH',
+                'node': node.node_id,
+                'topic': topic,
+                'payload': payload_str,
+                'qos': qos,
+                'retain': retain,
+                'timestamp': time.time()
+            })
+        
+        result = await original_publish(topic, payload, qos, retain)
+        
+        # For QoS 1, add ACK message (only for sensor data)
+        if qos == 1 and result and 'status' not in topic:
+            mqtt_operations.append({
+                'type': 'PUBACK',
+                'node': 'broker',
+                'to_node': node.node_id,
+                'from_node': node.node_id,  # Fix: add from_node for proper display
+                'topic': topic,
+                'payload': payload_str,
+                'qos': qos,
+                'timestamp': time.time() + 0.05  # ACK comes slightly after
+            })
+        
+        # Simulate subscribers receiving the message (only sensor data)
+        if 'status' not in topic:
+            for subscriber in nodes_ref:
+                if subscriber.node_id != node.node_id and subscriber.role in ['subscriber', 'both']:
+                    # Check if subscriber is subscribed to this topic
+                    if not subscriber.subscribe_to or node.node_id in subscriber.subscribe_to:
+                        mqtt_operations.append({
+                            'type': 'RECEIVED',
+                            'node': subscriber.node_id,
+                            'from_node': node.node_id,
+                            'topic': topic,
+                            'payload': payload_str,
+                            'qos': qos,
+                            'timestamp': time.time() + 0.1  # Received after publish
+                        })
+        
+        return result
     
     async def hooked_subscribe(topic, qos=0):
-        mqtt_operations.append({
-            'type': 'SUBSCRIBE',
-            'node': node.node_id,
-            'topic': topic,
-            'qos': qos,
-            'timestamp': time.time()
-        })
+        # Filter out status subscriptions - only log sensor data subscriptions
+        if 'status' not in topic and 'command' not in topic:
+            mqtt_operations.append({
+                'type': 'SUBSCRIBE',
+                'node': node.node_id,
+                'topic': topic,
+                'qos': qos,
+                'timestamp': time.time()
+            })
         return await original_subscribe(topic, qos)
     
     client.publish = hooked_publish
@@ -86,6 +124,8 @@ def broadcast_updates():
                     'battery': state.get('battery', 100),
                     'is_mobile': state.get('is_mobile', False),
                     'position': state.get('position', [0, 0]),
+                    'qos': state.get('qos', 1),
+                    'sensor_interval': state.get('sensor_interval', 10),
                     'stats': state.get('stats', {}),
                     'mqtt_stats': state.get('mqtt_stats', {}),
                     'mac_stats': state.get('mac_stats', {}),
@@ -103,6 +143,8 @@ def broadcast_updates():
                     'battery': 100,
                     'is_mobile': False,
                     'position': [0, 0],
+                    'qos': getattr(n, 'qos', 1),
+                    'sensor_interval': getattr(n, 'sensor_interval', 10),
                     'stats': {},
                     'mqtt_stats': {},
                     'mac_stats': {},
@@ -163,8 +205,10 @@ def broadcast_messages():
         for op in new_ops:
             socketio.emit('message', {
                 'msg_type': op['type'],
-                'from': op['node'],
-                'topic': op['topic'],
+                'from': op.get('node', ''),
+                'to': op.get('to_node', ''),
+                'from_node': op.get('from_node', ''),
+                'topic': op.get('topic', ''),
                 'payload': op.get('payload', ''),
                 'qos': op.get('qos', 0),
                 'retain': op.get('retain', False),
@@ -236,6 +280,8 @@ def add_node():
         position_y = data.get('position_y', None)
         node_role = data.get('role', 'both')  # publisher, subscriber, both
         subscribe_to = data.get('subscribe_to', [])  # List of node IDs to subscribe to
+        qos = data.get('qos', 1)  # QoS level: 0 or 1
+        sensor_interval = data.get('sensor_interval', 10.0)  # Sensor reading interval in seconds
         
         # Create new node - IMPORTANT: Keep protocol as-is
         node = Node(node_id, protocol, is_mobile, broker_address)
@@ -253,9 +299,15 @@ def add_node():
         if position_x is not None and position_y is not None:
             node.position = (float(position_x), float(position_y))
         
-        # Set node role
+        # Set node role, QoS, and sensor interval
         node.role = node_role
         node.subscribe_to = subscribe_to
+        node.qos = int(qos)  # Ensure it's an integer
+        node.sensor_interval = float(sensor_interval)  # Ensure it's a float
+        
+        # Also set QoS on MQTT client for consistency
+        if hasattr(node, 'mqtt_client') and node.mqtt_client:
+            node.mqtt_client.default_qos = int(qos)
         
         nodes_ref.append(node)
         

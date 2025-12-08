@@ -28,6 +28,8 @@ class Node:
         self.broker_address = broker_address
         self.role = 'both'  # publisher, subscriber, both
         self.subscribe_to = []  # List of specific node IDs to subscribe to
+        self.qos = 1  # Default QoS level (will be set by user)
+        self.sensor_interval = 10.0  # Default sensor interval (will be set by user)
         
         # PHY profiles (node knows both)
         self.ble_profile = get_profile('ble')
@@ -68,8 +70,7 @@ class Node:
             'position_updates': 0
         }
         
-        # Sensor data generation
-        self.sensor_interval = random.uniform(5.0, 15.0)  # seconds
+        # Sensor data generation (will be set by user or use default)
         self.last_sensor_reading = 0
         
     async def run(self):
@@ -163,8 +164,9 @@ class Node:
             result = await self.mac.send_packet(payload, "broker")
             
             if result.get('success'):
-                # Publish via MQTT
-                await self.mqtt_client.publish(topic, payload, qos=1)
+                # Publish via MQTT with configured QoS (ensure it's used)
+                qos_level = int(self.qos) if hasattr(self, 'qos') else 1
+                await self.mqtt_client.publish(topic, payload, qos=qos_level)
                 
                 # Track energy
                 self.energy_tracker.add_tx_energy(len(payload))
@@ -230,6 +232,8 @@ class Node:
             'position': self.position,
             'connected': self.mqtt_client.connected,
             'battery': self.energy_tracker.battery_level,
+            'qos': self.qos,
+            'sensor_interval': self.sensor_interval,
             'stats': self.stats,
             'mqtt_stats': self.mqtt_client.get_stats(),
             'mac_stats': self.mac.get_stats(),
