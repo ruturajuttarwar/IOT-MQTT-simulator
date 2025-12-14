@@ -46,8 +46,10 @@ class BLEMAC:
             'supervision_timeouts': 0
         }
         
-    async def send_packet(self, packet: bytes, dest: str) -> Dict:
-        """Send packet during connection event"""
+    async def send_packet(self, packet: bytes, dest: str, distance: float = 0, max_range: float = 400) -> Dict:
+        """Send packet during connection event with distance-based PDR"""
+        from utils.phy_utils import calculate_pdr
+        
         # Check queue
         if len(self.queue) >= self.max_queue_size:
             self.stats['packets_dropped'] += 1
@@ -55,6 +57,9 @@ class BLEMAC:
             
         # Add to queue
         self.queue.append((packet, dest))
+        
+        # Calculate PDR based on distance
+        pdr = calculate_pdr(distance, max_range, 'ble')
         
         # Wait for next connection event
         await self._wait_for_connection_event()
@@ -64,10 +69,11 @@ class BLEMAC:
         tx_time_us = (packet_size * 8 * 1_000_000 / self.profile['data_rate_bps']) + \
                      self.profile['packet_overhead_us'] + self.profile['preamble_time_us']
         
-        # Simulate packet loss (5%)
-        if random.random() < 0.05:
+        # Simulate packet loss based on distance
+        packet_loss_prob = 1.0 - pdr
+        if random.random() < packet_loss_prob:
             # Retry in next connection event
-            return await self._retry_packet(packet, dest)
+            return await self._retry_packet(packet, dest, distance, max_range, 0)
             
         self.stats['packets_sent'] += 1
         
@@ -75,7 +81,8 @@ class BLEMAC:
             'success': True,
             'tx_time_us': tx_time_us,
             'conn_interval_ms': self.conn_interval_ms,
-            'retries': 0
+            'retries': 0,
+            'pdr': pdr
         }
         
     async def _wait_for_connection_event(self):
@@ -90,8 +97,10 @@ class BLEMAC:
         self.sleeping = False
         self.stats['connection_events'] += 1
         
-    async def _retry_packet(self, packet: bytes, dest: str, retry_count: int = 0) -> Dict:
-        """Retry packet in next connection event"""
+    async def _retry_packet(self, packet: bytes, dest: str, distance: float, max_range: float, retry_count: int = 0) -> Dict:
+        """Retry packet in next connection event with distance-based PDR"""
+        from utils.phy_utils import calculate_pdr
+        
         if retry_count >= 3:  # Max 3 retries for BLE
             self.stats['packets_dropped'] += 1
             return {'success': False, 'reason': 'max_retries', 'retries': retry_count}
@@ -101,21 +110,28 @@ class BLEMAC:
         # Wait for next connection event
         await self._wait_for_connection_event()
         
-        # Try again
-        if random.random() < 0.05:
-            return await self._retry_packet(packet, dest, retry_count + 1)
-            
-        # Success
-        self.stats['packets_sent'] += 1
+        # Calculate PDR for retry
+        pdr = calculate_pdr(distance, max_range, 'ble')
+        packet_loss_prob = 1.0 - pdr
+        
+        # Calculate transmission time (each retry costs energy!)
         packet_size = len(packet)
         tx_time_us = (packet_size * 8 * 1_000_000 / self.profile['data_rate_bps']) + \
                      self.profile['packet_overhead_us']
+        
+        # Try again with distance-based success probability
+        if random.random() < packet_loss_prob:
+            return await self._retry_packet(packet, dest, distance, max_range, retry_count + 1)
+            
+        # Success
+        self.stats['packets_sent'] += 1
         
         return {
             'success': True,
             'tx_time_us': tx_time_us,
             'conn_interval_ms': self.conn_interval_ms,
-            'retries': retry_count + 1
+            'retries': retry_count + 1,
+            'pdr': pdr
         }
         
     def set_connection_interval(self, interval_ms: int):
@@ -177,5 +193,6 @@ class BLEMAC:
         return {
             **self.stats,
             'state': self.state,
-            'connected_peer': self.connected_peer
+            'connected_peer': self.connected_peer,
+            'packets_received': self.stats.get('packets_received', 0)
         }

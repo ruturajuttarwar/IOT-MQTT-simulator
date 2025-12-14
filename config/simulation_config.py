@@ -37,4 +37,4 @@ INITIAL_BATTERY_LEVEL = 100.0  # percentage
 
 # GUI Configuration
 GUI_UPDATE_RATE = 1.0  # seconds
-GUI_PORT = 8000
+GUI_PORT = 5001  # Backend API port (avoiding macOS AirPlay on 5000)

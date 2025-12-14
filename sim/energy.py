@@ -14,6 +14,10 @@ class EnergyTracker:
         self.battery_level = 100.0  # percentage
         self.total_energy_mj = 0.0  # millijoules
         
+        # Battery capacity (typical CR2032 coin cell = 200mAh @ 3V = 2160 Joules = 2,160,000 mJ)
+        # ACCELERATED 10x for simulation visibility (real: 2,160,000 mJ)
+        self.battery_capacity_mj = 216_000.0  # millijoules (10x faster depletion for demo)
+        
         # Time tracking (microseconds)
         self.tx_time_us = 0
         self.rx_time_us = 0
@@ -29,20 +33,26 @@ class EnergyTracker:
         now = time.time()
         duration_us = (now - self.last_update) * 1_000_000
         
-        if self.current_state == 'tx':
-            self.tx_time_us += duration_us
-            energy_mj = self.phy_profile['tx_power_mw'] * duration_us / 1000.0
-        elif self.current_state == 'rx':
-            self.rx_time_us += duration_us
-            energy_mj = self.phy_profile['rx_power_mw'] * duration_us / 1000.0
-        elif self.current_state == 'sleep':
-            self.sleep_time_us += duration_us
-            energy_mj = self.phy_profile['sleep_power_mw'] * duration_us / 1000.0
-        else:  # idle
-            self.idle_time_us += duration_us
-            energy_mj = self.phy_profile['idle_power_mw'] * duration_us / 1000.0
+        # Only track energy if duration is reasonable (< 60 seconds)
+        # This prevents huge energy drain from initial startup
+        if duration_us < 60_000_000:  # Less than 60 seconds
+            if self.current_state == 'tx':
+                self.tx_time_us += duration_us
+                energy_mj = self.phy_profile['tx_power_mw'] * duration_us / 1_000_000.0
+            elif self.current_state == 'rx':
+                self.rx_time_us += duration_us
+                energy_mj = self.phy_profile['rx_power_mw'] * duration_us / 1_000_000.0
+            elif self.current_state == 'sleep':
+                self.sleep_time_us += duration_us
+                energy_mj = self.phy_profile['sleep_power_mw'] * duration_us / 1_000_000.0
+            else:  # idle
+                self.idle_time_us += duration_us
+                energy_mj = self.phy_profile['idle_power_mw'] * duration_us / 1_000_000.0
+                
+            self.total_energy_mj += energy_mj
             
-        self.total_energy_mj += energy_mj
+            # Update battery level
+            self._update_battery_level()
         
         # Update state
         self.current_state = state
@@ -53,10 +63,14 @@ class EnergyTracker:
         tx_time_us = (packet_size_bytes * 8 * 1_000_000 / self.phy_profile['data_rate_bps']) + \
                      self.phy_profile.get('packet_overhead_us', 0)
         
-        energy_mj = self.phy_profile['tx_power_mw'] * tx_time_us / 1000.0
+        # Energy in millijoules
+        energy_mj = self.phy_profile['tx_power_mw'] * tx_time_us / 1_000_000.0
         
         self.total_energy_mj += energy_mj
         self.tx_time_us += tx_time_us
+        
+        # Update battery level
+        self._update_battery_level()
         
         return energy_mj
         
@@ -65,12 +79,21 @@ class EnergyTracker:
         rx_time_us = (packet_size_bytes * 8 * 1_000_000 / self.phy_profile['data_rate_bps']) + \
                      self.phy_profile.get('packet_overhead_us', 0)
         
-        energy_mj = self.phy_profile['rx_power_mw'] * rx_time_us / 1000.0
+        # Energy in millijoules
+        energy_mj = self.phy_profile['rx_power_mw'] * rx_time_us / 1_000_000.0
         
         self.total_energy_mj += energy_mj
         self.rx_time_us += rx_time_us
         
+        # Update battery level
+        self._update_battery_level()
+        
         return energy_mj
+    
+    def _update_battery_level(self):
+        """Update battery level based on energy consumed"""
+        # Battery level as percentage of remaining capacity
+        self.battery_level = max(0.0, 100.0 * (1.0 - self.total_energy_mj / self.battery_capacity_mj))
         
     def get_stats(self) -> Dict:
         """Get energy statistics"""

@@ -52,24 +52,14 @@ async def initialize_simulation():
         failover_broker=BROKER_FAILOVER
     )
     
-    # Create initial nodes (just 1 node to start)
-    log_info(f"Creating initial node...")
+    # No default nodes - users create them via dashboard
+    log_info(f"No default nodes created")
+    log_info(f"  - Use the dashboard to add nodes dynamically")
     
-    # Create one initial node
-    node = Node(
-        node_id=f"node_0",
-        protocol='wifi',
-        is_mobile=False,
-        broker_address=BROKER_PRIMARY
-    )
-    nodes.append(node)
-        
-    log_success(f"Created {len(nodes)} initial node")
-    log_info(f"  - Use the dashboard to add more nodes dynamically")
-    
-    # Register nodes with failover manager
+    # Register nodes with failover manager (if any exist)
     for node in nodes:
         failover_manager.register_node(node)
+        node.failover_manager = failover_manager  # Link failover manager to node
         
     log_success("Simulation initialized successfully")
     

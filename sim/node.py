@@ -71,11 +71,55 @@ class Node:
         }
         
         # Sensor data generation (will be set by user or use default)
-        self.last_sensor_reading = 0
+        self.last_sensor_reading = time.time()  # Initialize to current time to prevent immediate publish
         
+    def calculate_distance_to_broker(self, broker_pos: tuple = None) -> float:
+        """Calculate distance to broker"""
+        # Use provided broker position or get from failover manager or default
+        if broker_pos is None:
+            # Try to get from failover manager if available
+            if hasattr(self, 'failover_manager') and self.failover_manager:
+                broker_address = self.broker_address
+                broker_pos = self.failover_manager.broker_positions.get(broker_address, (500, 500))
+            else:
+                broker_pos = (500, 500)  # Default center
+        
+        dx = self.position[0] - broker_pos[0]
+        dy = self.position[1] - broker_pos[1]
+        return math.sqrt(dx*dx + dy*dy)
+    
+    def is_in_range(self) -> bool:
+        """Check if node is within range of broker"""
+        distance = self.calculate_distance_to_broker()
+        max_range = self.phy_profile.get('range_meters', 100)
+        return distance <= max_range
+    
+    def calculate_latency_ms(self) -> float:
+        """Calculate latency based on distance and protocol"""
+        distance = self.calculate_distance_to_broker()
+        base_latency = self.phy_profile.get('base_latency_ms', 10)
+        
+        # Add distance-based latency (signal propagation + processing)
+        # WiFi: distance increases latency/jitter
+        # BLE: connection interval dominates
+        if self.protocol == 'wifi':
+            distance_latency = distance * 0.1  # 0.1ms per meter
+        else:  # BLE
+            distance_latency = distance * 0.05  # Less affected by distance
+        
+        return base_latency + distance_latency
+    
     async def run(self):
         """Main node loop"""
         self.running = True
+        
+        # Check if in range before connecting
+        if not self.is_in_range():
+            distance = self.calculate_distance_to_broker()
+            max_range = self.phy_profile.get('range_meters', 100)
+            print(f"[RANGE] Node {self.node_id} out of range: {distance:.1f}m > {max_range}m")
+            self.connected = False
+            return
         
         # Connect to broker
         await self.mqtt_client.connect()
@@ -83,20 +127,47 @@ class Node:
         
         # Subscribe to topics based on role
         if self.role in ['subscriber', 'both']:
+            # Set up message callback to track RX energy
+            async def on_message_received(message):
+                # Track RX energy when receiving messages
+                payload_size = len(message.get('payload', b''))
+                self.energy_tracker.set_state('rx')
+                rx_energy = self.energy_tracker.add_rx_energy(payload_size)
+                self.stats['messages_received'] += 1
+                print(f"[RX] Node {self.node_id} received {payload_size}B, RX energy: {rx_energy:.4f} mJ, Battery: {self.energy_tracker.battery_level:.2f}%")
+                # Back to idle
+                self.energy_tracker.set_state('idle')
+            
+            self.mqtt_client.on_message_callback = on_message_received
+            
             if self.subscribe_to:
-                # Subscribe to specific publishers
+                # Subscribe to specific publishers with node's QoS
                 for publisher_id in self.subscribe_to:
-                    await self.mqtt_client.subscribe(f"sensors/{publisher_id}/data")
+                    await self.mqtt_client.subscribe(f"sensors/{publisher_id}/data", qos=self.qos)
             else:
-                # Subscribe to all
-                await self.mqtt_client.subscribe(f"sensors/+/data")
+                # Subscribe to all with node's QoS
+                await self.mqtt_client.subscribe(f"sensors/+/data", qos=self.qos)
             
             # Always subscribe to own command topic
-            await self.mqtt_client.subscribe(f"nodes/{self.node_id}/command")
+            await self.mqtt_client.subscribe(f"nodes/{self.node_id}/command", qos=self.qos)
         
         # Main loop
         while self.running:
             try:
+                # Check if node is dead (no battery)
+                if self.energy_tracker.battery_level <= 0:
+                    print(f"[DEAD] Node {self.node_id} has died (0% battery)")
+                    self.running = False
+                    self.connected = False
+                    # Publish death message
+                    try:
+                        death_msg = f"Node {self.node_id} DEAD - Battery depleted".encode()
+                        await self.mqtt_client.publish(f"nodes/{self.node_id}/status", death_msg, qos=0)
+                    except:
+                        pass
+                    await self.mqtt_client.disconnect(send_lwt=True)
+                    break
+                
                 # Check if simulation is stopped
                 if not self.running:
                     await asyncio.sleep(0.5)
@@ -110,9 +181,21 @@ class Node:
                     if old_pos != self.position:
                         self.stats['position_updates'] += 1
                         
+                        # Check if still in range after moving
+                        if not self.is_in_range():
+                            distance = self.calculate_distance_to_broker()
+                            max_range = self.phy_profile.get('range_meters', 100)
+                            print(f"[DISCONNECT] Node {self.node_id} moved out of range: {distance:.1f}m > {max_range}m")
+                            self.connected = False
+                            await self.mqtt_client.disconnect(send_lwt=True)
+                            break
+                        
                 # Intelligent protocol selection DISABLED - keep user's choice
                 # Users can manually set protocol via UI
                 pass
+                
+                # Ensure we're in idle state at start of loop
+                self.energy_tracker.set_state('idle')
                 
                 # Generate sensor data only if publisher
                 if self.role in ['publisher', 'both']:
@@ -126,7 +209,7 @@ class Node:
                     # Try to reconnect
                     await self.mqtt_client.reconnect()
                     
-                # Update energy state
+                # Update energy state - use sleep if supported, otherwise idle
                 if self.mac.is_sleeping() if hasattr(self.mac, 'is_sleeping') else False:
                     self.energy_tracker.set_state('sleep')
                 else:
@@ -142,8 +225,11 @@ class Node:
         """Generate and publish sensor data"""
         current_time = time.time()
         
-        if current_time - self.last_sensor_reading >= self.sensor_interval:
-            self.last_sensor_reading = current_time
+        # Check if enough time has passed since last reading
+        time_since_last = current_time - self.last_sensor_reading
+        if time_since_last >= self.sensor_interval:
+            # Debug: Log when we're about to publish
+            print(f"[DEBUG] Node {self.node_id}: Publishing (interval={self.sensor_interval}s, time_since_last={time_since_last:.1f}s)")
             
             # Generate sensor reading
             temperature = random.uniform(20.0, 30.0)
@@ -157,22 +243,49 @@ class Node:
             if global_metrics:
                 global_metrics.record_topic_message(topic)
             
+            # Check if node has enough battery
+            if self.energy_tracker.battery_level <= 0:
+                print(f"[ENERGY] Node {self.node_id} is DEAD (0% battery)")
+                self.running = False
+                return
+            
             # Set energy state to TX
             self.energy_tracker.set_state('tx')
             
-            # Send via MAC layer
-            result = await self.mac.send_packet(payload, "broker")
+            # Calculate distance to broker for MAC layer
+            distance = self.calculate_distance_to_broker()
+            max_range = self.phy_profile.get('range_meters', 100)
+            
+            # Send via MAC layer with distance
+            result = await self.mac.send_packet(payload, "broker", distance, max_range)
             
             if result.get('success'):
                 # Publish via MQTT with configured QoS (ensure it's used)
                 qos_level = int(self.qos) if hasattr(self, 'qos') else 1
                 await self.mqtt_client.publish(topic, payload, qos=qos_level)
                 
-                # Track energy
-                self.energy_tracker.add_tx_energy(len(payload))
+                # Track TX energy for initial transmission
+                energy_used = self.energy_tracker.add_tx_energy(len(payload))
+                
+                # Track ADDITIONAL energy for retries (critical fix!)
+                num_retries = result.get('retries', 0)
+                if num_retries > 0:
+                    for _ in range(num_retries):
+                        retry_energy = self.energy_tracker.add_tx_energy(len(payload))
+                        energy_used += retry_energy
+                    print(f"[ENERGY] Node {self.node_id} TX with {num_retries} retries: {energy_used:.4f} mJ, Battery: {self.energy_tracker.battery_level:.2f}%")
+                else:
+                    print(f"[ENERGY] Node {self.node_id} TX: {energy_used:.4f} mJ, Battery: {self.energy_tracker.battery_level:.2f}%")
+                
+                # Log PDR if available
+                if 'pdr' in result:
+                    print(f"[PDR] Node {self.node_id} at {distance:.1f}m: PDR={result['pdr']:.2%}")
                 
                 self.stats['messages_sent'] += 1
                 self.stats['sensor_readings'] += 1
+                
+                # IMPORTANT: Update last_sensor_reading AFTER successful publish
+                self.last_sensor_reading = current_time
                 
             # Back to idle
             self.energy_tracker.set_state('idle')
@@ -234,6 +347,9 @@ class Node:
             'battery': self.energy_tracker.battery_level,
             'qos': self.qos,
             'sensor_interval': self.sensor_interval,
+            'distance_to_broker': self.calculate_distance_to_broker(),
+            'max_range': self.phy_profile.get('range_meters', 100),
+            'latency_ms': self.calculate_latency_ms(),
             'stats': self.stats,
             'mqtt_stats': self.mqtt_client.get_stats(),
             'mac_stats': self.mac.get_stats(),
